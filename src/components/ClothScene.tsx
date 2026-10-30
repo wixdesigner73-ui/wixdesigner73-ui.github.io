@@ -89,7 +89,7 @@ function Garage({ mobile }: { mobile: boolean }) {
           </sprite>
         </group>
       ))}
-      <pointLight position={[-1.2, 4.6, -3]} intensity={140} distance={26} decay={1.6} color="#dfe8ff" />
+      <pointLight position={[-1.2, 4.6, -3]} intensity={95} distance={26} decay={1.6} color="#dfe8ff" />
       <pointLight position={[-7.5, 2.4, -2]} intensity={26} distance={14} decay={1.8} color="#d6a566" />
     </group>
   )
@@ -135,7 +135,7 @@ function Car({ r, onReady, mobile }: { r: MutableRefObject<number>; onReady: () 
   const flares = useRef<THREE.Group>(null)
   useFrame(() => {
     const on = smoothstep(r.current, 0.35, 0.6)
-    if (key.current) key.current.intensity = 20 + 190 * smoothstep(r.current, 0.35, 0.85)
+    if (key.current) key.current.intensity = 70 + 150 * smoothstep(r.current, 0.35, 0.85)
     flares.current?.children.forEach((c) => ((c as THREE.Sprite).material.opacity = 0.95 * on))
     if (mats.Projector_Glass) mats.Projector_Glass.emissiveIntensity = 9 * on
     if (mats.Turn_Signal_LED) mats.Turn_Signal_LED.emissiveIntensity = 3.5 * on
@@ -161,80 +161,205 @@ function Car({ r, onReady, mobile }: { r: MutableRefObject<number>; onReady: () 
   )
 }
 
-/* ---------- the cloth ---------- */
-const PROFILE: [number, number][] = [[-3.4, 0], [-2.8, 0.5], [-2.3, 0.97], [-1.2, 1.17], [-0.3, 1.44], [0.7, 1.37], [1.4, 1.14], [1.9, 0.8]]
-const prof = (z: number) => {
-  for (let i = 0; i < PROFILE.length - 1; i++) {
-    const [z0, y0] = PROFILE[i], [z1, y1] = PROFILE[i + 1]
-    if (z <= z1) { const t = clamp((z - z0) / (z1 - z0), 0, 1); return lerp(y0, y1, t * t * (3 - 2 * t)) }
+/* ---------- the cloth: position-based dynamics (verlet + distance constraints) ---------- */
+type P = [number, number][]
+const interp = (pts: P, z: number) => {
+  if (z <= pts[0][0] || z >= pts[pts.length - 1][0]) return 0
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [z0, y0] = pts[i], [z1, y1] = pts[i + 1]
+    if (z <= z1) { const t = (z - z0) / (z1 - z0); return y0 + (y1 - y0) * t * t * (3 - 2 * t) }
   }
-  return PROFILE[PROFILE.length - 1][1]
+  return 0
+}
+const CAR_H: P = [[-2.4, 0], [-2.32, 0.45], [-2.1, 0.9], [-1.3, 1.0], [-0.6, 1.12], [-0.1, 1.22], [0.5, 1.16], [1.1, 0.98], [1.7, 0.82], [2.1, 0.62], [2.28, 0.3], [2.36, 0]]
+const carW = (z: number) => 0.95 - 0.2 * smoothstep(Math.abs(z), 1.3, 2.3)
+
+class ClothSim {
+  W: number; H: number; n: number
+  pos: Float32Array; prev: Float32Array
+  pinned: Uint8Array
+  a: Int32Array; b: Int32Array; rest: Float32Array; k: Float32Array
+  front: number[] = []; rest0: Float32Array = new Float32Array(0)
+  iters: number
+  anchored = false
+
+  constructor(W: number, H: number, iters: number) {
+    this.W = W; this.H = H; this.iters = iters
+    const n = (this.n = (W + 1) * (H + 1))
+    this.pos = new Float32Array(n * 3); this.prev = new Float32Array(n * 3); this.pinned = new Uint8Array(n)
+    for (let i = 0; i <= H; i++) for (let j = 0; j <= W; j++) {
+      const id = (i * (W + 1) + j) * 3
+      const x = -1.6 + (3.2 * j) / W, z = -3.4 + (5.35 * i) / H
+      const jitter = (Math.sin(j * 12.9898 + i * 78.233) * 43758.5453) % 1
+      // tailored cover: starts already draped over the car, rest lengths come from this shape
+      const side = 1 - smoothstep(Math.abs(x), carW(z) + 0.04, carW(z) + 0.42)
+      const y = 0.03 + (interp(CAR_H, z) + 0.06) * Math.pow(side, 0.85) + 0.012 * jitter
+      this.pos[id] = x
+      this.pos[id + 1] = y
+      this.pos[id + 2] = z
+    }
+    this.prev.set(this.pos)
+    const A: number[] = [], B: number[] = [], K: number[] = []
+    const add = (i0: number, j0: number, i1: number, j1: number, w: number) => {
+      if (i1 > H || j1 > W || j1 < 0) return
+      A.push(i0 * (W + 1) + j0); B.push(i1 * (W + 1) + j1); K.push(w)
+    }
+    for (let i = 0; i <= H; i++) for (let j = 0; j <= W; j++) {
+      add(i, j, i, j + 1, 1); add(i, j, i + 1, j, 1)
+      add(i, j, i + 1, j + 1, 0.7); add(i, j, i + 1, j - 1, 0.7)
+      add(i, j, i, j + 2, 0.22); add(i, j, i + 2, j, 0.22)
+    }
+    this.a = Int32Array.from(A); this.b = Int32Array.from(B); this.k = Float32Array.from(K)
+    this.rest = new Float32Array(A.length)
+    for (let c = 0; c < A.length; c++) {
+      const p = this.a[c] * 3, q = this.b[c] * 3
+      this.rest[c] = Math.hypot(this.pos[p] - this.pos[q], this.pos[p + 1] - this.pos[q + 1], this.pos[p + 2] - this.pos[q + 2]) * 1.004
+    }
+    for (let row = H; row >= H - 2; row--) for (let j = 0; j <= W; j++) this.front.push(row * (W + 1) + j)
+  }
+
+  collide() {
+    const p = this.pos, pr = this.prev
+    for (let v = 0; v < this.n; v++) {
+      if (this.pinned[v]) continue
+      const o = v * 3
+      let x = p[o], y = p[o + 1]
+      const z = p[o + 2]
+      if (y < 0.012) { y = 0.012; pr[o] += (x - pr[o]) * 0.25; pr[o + 2] += (z - pr[o + 2]) * 0.25 }
+      const h = interp(CAR_H, z)
+      if (h > 0.05) {
+        const hx = carW(z) + 0.035, hy = h + 0.035
+        const ax = Math.abs(x) / hx, ay = y / hy
+        const f = ax * ax * ax * ax + ay * ay * ay * ay
+        if (f < 1) {
+          const s = Math.sqrt(Math.sqrt(f))
+          if (s < 1e-3) { y = hy } else { x /= s; y /= s }
+          pr[o] += (x - pr[o]) * 0.2; pr[o + 1] += (y - pr[o + 1]) * 0.2; pr[o + 2] += (z - pr[o + 2]) * 0.2
+        }
+      }
+      p[o] = x; p[o + 1] = y
+    }
+  }
+
+  step(dt: number) {
+    const p = this.pos, pr = this.prev, n3 = this.n * 3
+    const g = -9.8 * dt * dt
+    for (let o = 0; o < n3; o += 3) {
+      if (this.pinned[o / 3]) continue
+      const vx = (p[o] - pr[o]) * 0.985, vy = (p[o + 1] - pr[o + 1]) * 0.985, vz = (p[o + 2] - pr[o + 2]) * 0.985
+      pr[o] = p[o]; pr[o + 1] = p[o + 1]; pr[o + 2] = p[o + 2]
+      p[o] += vx; p[o + 1] += vy + g; p[o + 2] += vz
+    }
+    const { a, b, rest, k } = this
+    for (let it = 0; it < this.iters; it++) {
+      for (let c = 0; c < a.length; c++) {
+        const i = a[c] * 3, j = b[c] * 3
+        const dx = p[j] - p[i], dy = p[j + 1] - p[i + 1], dz = p[j + 2] - p[i + 2]
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-6
+        const diff = ((d - rest[c]) / d) * k[c]
+        const pa = this.pinned[a[c]], pb = this.pinned[b[c]]
+        if (pa && pb) continue
+        const wa = pa ? 0 : pb ? 1 : 0.5, wb = pb ? 0 : pa ? 1 : 0.5
+        p[i] += dx * diff * wa; p[i + 1] += dy * diff * wa; p[i + 2] += dz * diff * wa
+        p[j] -= dx * diff * wb; p[j + 1] -= dy * diff * wb; p[j + 2] -= dz * diff * wb
+      }
+    }
+    this.collide()
+  }
+
+  settle(frames = 140) {
+    for (let f = 0; f < frames; f++) this.step(1 / 60)
+    this.rest0 = Float32Array.from(this.front.flatMap((v) => [this.pos[v * 3], this.pos[v * 3 + 1], this.pos[v * 3 + 2]]))
+  }
+
+  /** grip the front hem and drag it up, back and away as r goes 0 -> 1 */
+  anchor(r: number, on: boolean) {
+    if (!on) {
+      if (this.anchored) { this.anchored = false; this.front.forEach((v) => (this.pinned[v] = 0)) }
+      return
+    }
+    this.anchored = true
+    const t1 = smoothstep(r, 0, 0.3), t2 = smoothstep(r, 0.25, 0.7), t3 = smoothstep(r, 0.65, 1)
+    const gather = 0.38 * smoothstep(r, 0.02, 0.55)
+    const dy = 1.5 * t1 + 0.5 * t2 + 2.6 * t3
+    const dz = -1.2 * t1 - 5 * t2 - 4.2 * t3
+    const dx = 1.0 * t2 + 3.6 * t3
+    this.front.forEach((v, idx) => {
+      const x0 = this.rest0[idx * 3], y0 = this.rest0[idx * 3 + 1], z0 = this.rest0[idx * 3 + 2]
+      const o = v * 3
+      this.pos[o] = x0 * (1 - gather) + dx
+      this.pos[o + 1] = y0 + dy
+      this.pos[o + 2] = z0 + dz
+      this.prev[o] = this.pos[o]; this.prev[o + 1] = this.pos[o + 1]; this.prev[o + 2] = this.pos[o + 2]
+      this.pinned[v] = 1
+    })
+  }
 }
 
-function Cloth({ r }: { r: MutableRefObject<number> }) {
-  const W = 80, H = 100
-  const { geo, base } = useMemo(() => {
-    const n = (W + 1) * (H + 1)
-    const pos = new Float32Array(n * 3)
-    const base = new Float32Array(n * 3)
-    let k = 0
-    for (let i = 0; i <= H; i++) for (let j = 0; j <= W; j++) {
-      const x = -2.7 + (5.4 * j) / W
-      let z = -3.4 + (5.3 * i) / H
-      if (i === H) z += 0.1 * Math.sin(x * 7)
-      const s = smoothstep(1.5 - Math.abs(x), 0, 0.62)
-      const folds = 0.05 * Math.sin(x * 7 + z * 1.6) * (s * (1 - s) * 4) + 0.025 * Math.sin(x * 13 - z * 4)
-      const ground = 0.025 * (1 + Math.sin(x * 5 + z * 3)) * (1 - s)
-      const y = 0.035 + prof(z) * Math.pow(s, 0.75) + folds + ground + (i === H ? -0.12 * Math.abs(Math.sin(x * 5)) : 0)
-      base[k] = x; base[k + 1] = y; base[k + 2] = z
-      pos[k] = x; pos[k + 1] = y; pos[k + 2] = z
-      k += 3
-    }
+function weaveTexture() {
+  const c = document.createElement('canvas')
+  c.width = c.height = 64
+  const x = c.getContext('2d')!
+  x.fillStyle = '#808080'; x.fillRect(0, 0, 64, 64)
+  for (let i = 0; i < 64; i += 4) {
+    x.fillStyle = '#9a9a9a'; x.fillRect(i, 0, 2, 64)
+    x.fillStyle = '#6a6a6a'; x.fillRect(0, i, 64, 2)
+  }
+  const t = new THREE.CanvasTexture(c)
+  t.wrapS = t.wrapT = THREE.RepeatWrapping
+  return t
+}
+
+function Cloth({ r, mobile }: { r: MutableRefObject<number>; mobile: boolean }) {
+  const { sim, geo } = useMemo(() => {
+    const sim = new ClothSim(mobile ? 44 : 60, mobile ? 44 : 64, mobile ? 4 : 6)
+    sim.settle()
+    const W = sim.W, H = sim.H
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(sim.pos.slice(), 3))
+    const uv = new Float32Array(sim.n * 2)
+    for (let i = 0; i <= H; i++) for (let j = 0; j <= W; j++) { const o = (i * (W + 1) + j) * 2; uv[o] = (j / W) * 34; uv[o + 1] = (i / H) * 33 }
+    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2))
     const idx: number[] = []
     for (let i = 0; i < H; i++) for (let j = 0; j < W; j++) {
       const a = i * (W + 1) + j, b = a + 1, c = a + W + 1, d = c + 1
       idx.push(a, c, b, b, c, d)
     }
-    const g = new THREE.BufferGeometry()
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
     g.setIndex(idx)
     g.computeVertexNormals()
-    return { geo: g, base }
-  }, [])
-  const mat = useRef<THREE.MeshStandardMaterial>(null)
+    return { sim, geo: g }
+  }, [mobile])
+  const weave = useMemo(() => weaveTexture(), [])
+  const mat = useRef<THREE.MeshPhysicalMaterial>(null)
   const mesh = useRef<THREE.Mesh>(null)
-  const last = useRef(-1)
+  const idle = useRef(0)
 
-  useFrame(({ clock }) => {
+  useFrame(() => {
     const rv = r.current
     const m = mesh.current!
-    m.visible = rv < 0.975
-    if (!m.visible) return
-    if (rv <= 0.0005 && last.current === 0) return
-    last.current = rv <= 0.0005 ? 0 : 1
-    const t = clock.elapsedTime
-    const p = geo.attributes.position.array as Float32Array
-    for (let k = 0; k < p.length; k += 3) {
-      const x = base[k], y = base[k + 1], z = base[k + 2]
-      const a = (1.9 - z) / 5.3
-      const pv = clamp((rv * 1.6 - a * 0.8) / 0.75, 0, 1)
-      const e = pv * pv * (3 - 2 * pv)
-      const fl = Math.sin(z * 2.2 + t * 5 + x * 1.5) * 0.2 * Math.sin(pv * Math.PI)
-      p[k] = x + e * (2.8 + 1.5 * a) + fl * 0.6
-      p[k + 1] = y + e * (4.6 + 3 * a) + fl
-      p[k + 2] = z - e * (8 + 4 * a)
+    const live = rv > 0.001
+    if (live) idle.current = 0
+    else idle.current++
+    if (live || idle.current < 180) {
+      sim.anchor(rv, live)
+      sim.step(1 / 60); sim.step(1 / 60)
+      sim.anchor(rv, live)
+      ;(geo.attributes.position.array as Float32Array).set(sim.pos)
+      geo.attributes.position.needsUpdate = true
+      geo.computeVertexNormals()
     }
-    geo.attributes.position.needsUpdate = true
-    geo.computeVertexNormals()
-    if (mat.current) mat.current.opacity = 1 - smoothstep(rv, 0.82, 0.97)
+    m.visible = rv < 0.99
+    if (mat.current) mat.current.opacity = 1 - smoothstep(rv, 0.9, 0.99)
   })
 
   return (
     <mesh ref={mesh} geometry={geo} frustumCulled={false}>
-      <meshStandardMaterial ref={mat} color="#d9d9d4" roughness={0.92} metalness={0} side={THREE.DoubleSide} transparent polygonOffset polygonOffsetFactor={-2} polygonOffsetUnits={-2} />
+      <meshPhysicalMaterial ref={mat} color="#c4c2bb" roughness={0.9} metalness={0} side={THREE.DoubleSide} transparent
+        bumpMap={weave} bumpScale={0.35} sheen={0.8} sheenRoughness={0.55} sheenColor="#ffffff" />
     </mesh>
   )
 }
+
 
 /* ---------- camera ---------- */
 function Rig({ r }: { r: MutableRefObject<number> }) {
@@ -287,7 +412,7 @@ export default function ClothScene({ progress, active, mobile, onReady }: {
       </Environment>
       <Garage mobile={mobile} />
       <Car r={r} onReady={onReady} mobile={mobile} />
-      <Cloth r={r} />
+      <Cloth r={r} mobile={mobile} />
       <Sparkles count={mobile ? 30 : 70} scale={[12, 6, 14]} position={[0, 3, -1]} size={2.2} speed={0.25} opacity={0.5} color="#ffffff" />
       <Rig r={r} />
     </Canvas>
