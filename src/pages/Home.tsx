@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import Hero from '../components/Hero'
 import CarReveal from '../components/CarReveal'
+import ClothReveal from '../components/ClothReveal'
 import ServicesList from '../components/ServicesList'
 import Showcase from '../components/Showcase'
 import CtaBand from '../components/CtaBand'
@@ -54,6 +55,7 @@ export default function Home() {
     <>
       <Hero />
       <CarReveal />
+      <ClothReveal />
       <AboutPreview />
       <ServicesList />
       <Showcase />
